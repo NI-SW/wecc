@@ -1,0 +1,3 @@
+[submodule "wecom-reader"]
+  path = wecom-reader
+  url = git@github.com:NI-SW/wecom-reader.git
