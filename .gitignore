@@ -1,0 +1,21 @@
+# 敏感配置
+.env
+upload.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# IDE
+.idea/
+
+# 数据文件
+*.db
+*.sqlite
+*.tar.gz
+
+# 系统文件
+Thumbs.db
+Desktop.ini
