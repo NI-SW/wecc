@@ -1,0 +1,13 @@
+# 企业微信聊天记录智能总结 — 依赖清单
+# Python >= 3.10
+#
+# 安装方式：
+#   pip install -r requirements.txt
+#
+# 注意：wecom-reader 以 editable 模式从 git 安装，
+#   如需可编辑开发请改用：
+#   pip install -e git+https://github.com/wangk-ask/wecom-reader.git#egg=wecom_reader
+
+# ── 核心依赖 ──────────────────────────────────────────────
+wecom-reader @ git+https://github.com/wangk-ask/wecom-reader.git
+requests>=2.28
