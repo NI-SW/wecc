@@ -3,8 +3,8 @@
 批量上传 summary JSON 问题到 DataCop 平台。
 
 用法:
-    python upload.py                          # 上传当前目录所有 summary JSON
-    python upload.py summary_华安基金_*.json   # 仅上传指定文件
+    python upload.py                          # 上传 summary/ 下所有 summary JSON（含日期子目录）
+    python upload.py summary_华安基金_*.json   # 仅上传指定文件（递归匹配日期子目录）
     python upload.py --dry-run                # 仅预览，不实际上传
 """
 
@@ -76,14 +76,40 @@ class DataCopClient:
 
 # ── 主流程 ────────────────────────────────────────────────────────
 def collect_files(patterns: list[str] | None, summary_dir: Path) -> list[Path]:
-    """收集要上传的 JSON 文件列表。"""
+    """收集要上传的 JSON 文件列表。
+
+    默认递归扫描 summary/ 下所有日期子目录与根目录中的 summary_*.json，
+    兼容新旧两种目录结构；显式指定文件名/通配符时同样递归匹配。
+    """
     if patterns:
-        files = []
+        files: list[Path] = []
         for p in patterns:
-            matched = list(summary_dir.glob(p)) if any(c in p for c in "*?[]") else [summary_dir / p]
+            if any(c in p for c in "*?[]"):
+                matched = list(summary_dir.glob(p))          # 用户自带子目录前缀
+                matched += list(summary_dir.glob(f"**/{p}")) # 递归匹配日期子目录
+            else:
+                matched = [summary_dir / p]
+                if not matched[0].is_file():
+                    matched = list(summary_dir.glob(f"**/{p}"))
             files.extend(m for m in matched if m.is_file())
-        return files
-    return sorted(summary_dir.glob("*.json"))
+        # 去重（保留顺序，避免 glob 重复命中同一文件）
+        seen = set()
+        unique = []
+        for f in files:
+            if f not in seen:
+                seen.add(f)
+                unique.append(f)
+        return unique
+    return sorted(summary_dir.glob("**/summary_*.json"))
+
+
+def _display_path(filepath: Path, summary_dir: Path) -> str:
+    """返回相对于 summary 目录的路径（如 260814/summary_xxx.json），
+    便于区分不同日期目录下同名文件。"""
+    try:
+        return filepath.relative_to(summary_dir).as_posix()
+    except ValueError:
+        return filepath.name
 
 
 def extract_problems(filepath: Path) -> list[dict]:
@@ -139,7 +165,7 @@ def main():
         for filepath in files:
             problems = extract_problems(filepath)
             if problems:
-                print(f"  [DRY] {filepath.name}: {len(problems)} 条问题")
+                print(f"  [DRY] {_display_path(filepath, summary_dir)}: {len(problems)} 条问题")
                 for i, p in enumerate(problems, 1):
                     print(f"         {i}. {p.get('name', '(无名称)')}")
                 total_ok += len(problems)
@@ -154,7 +180,7 @@ def main():
         if not problems:
             continue
 
-        print(f"  [FILE] {filepath.name} ({len(problems)} 条)")
+        print(f"  [FILE] {_display_path(filepath, summary_dir)} ({len(problems)} 条)")
         for i, problem in enumerate(problems, 1):
             name = problem.get("name", "(无名称)")
             try:
