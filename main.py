@@ -4,7 +4,7 @@
 ==================================
 功能：
 1. 从企业微信解密数据库读取聊天记录（含图片信息）
-2. 从 conversation.list 读取群聊名称，按名称匹配会话
+2. 从 conversation.list 读取会话名称（群名或人名），按名称匹配会话（含单聊）
 3. 将聊天记录按天划分，尾部插入 prompt.md 提示词，发送到智能体进行问题总结
 4. 将智能体返回的问题总结写入 JSON 文件，并更新数据库中的会话处理进度
 
@@ -483,7 +483,7 @@ def parse_args():
 使用示例:
   python main.py                          # 使用默认配置运行
   python main.py -h                       # 查看使用说明
-  python main.py -c my.list -d 14         # 指定群聊列表，拉取最近14天
+  python main.py -c my.list -d 14         # 指定会话列表，拉取最近14天
   python main.py -l 500 --days 30         # 最多拉500条，时间窗口30天
   python main.py -o results               # 总结输出到 results/ 目录
   python main.py --temperature 0.3        # 调高模型温度（更随机）
@@ -494,7 +494,7 @@ def parse_args():
     )
     p.add_argument("-c", "--conversation-list",
                    default="conversation.list",
-                   help="群聊名称列表文件路径，每行一个群名 (默认: conversation.list)")
+                   help="会话名称列表文件路径，每行一个群名或人名 (默认: conversation.list)")
     p.add_argument("-p", "--prompt",
                    default="prompt.md",
                    help="提示词模板文件路径 (默认: prompt.md)")
@@ -505,8 +505,9 @@ def parse_args():
                    default="data/wecom.db",
                    help="进度数据库路径 (默认: data/wecom.db)")
     p.add_argument("--decrypted-dir",
-                   default=r"C:\Users\DELL\PycharmProjects\PythonProject\wecom-reader\wxwork_decrypted",
-                   help="解密后的企业微信数据库目录")
+                   default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        "wecom-reader", "wxwork_decrypted"),
+                   help="解密后的企业微信数据库目录 (默认: <脚本目录>/wecom-reader/wxwork_decrypted)")
     p.add_argument("--db-dir",
                    default=None,
                    help="企业微信原始 Data 目录（首次运行自动解密用）")
@@ -563,43 +564,104 @@ def main():
         reader_kwargs["wxwork_dir"] = wxwork_dir
     reader = WeComReader(**reader_kwargs)
     status = reader.status()
-    if not status.get("decrypted"):
-        db_dir = args.db_dir
+
+    # 解密源目录：--db-dir 优先，其次 .env 的 WXWORK_DIR/Data
+    db_dir = args.db_dir
+    if not db_dir and wxwork_dir:
+        candidate = os.path.join(wxwork_dir, "Data")
+        if os.path.isdir(candidate):
+            db_dir = candidate
+
+    need_decrypt = not status.get("decrypted")
+    if args.db_dir and status.get("decrypted"):
+        # 用户显式指定了源库目录，视为要求重新解密（覆盖旧的解密快照）
+        print("[INFO] 已指定 --db-dir，将重新解密（忽略已有解密快照）...")
+        need_decrypt = True
+    elif status.get("decrypted") and db_dir:
+        # 未显式指定源库时，源库比解密快照新说明有新消息，增量重新解密
+        stale = [
+            name for name in ("message.db", "session.db", "user.db")
+            if os.path.isfile(os.path.join(db_dir, name))
+            and (
+                not os.path.isfile(os.path.join(args.decrypted_dir, name))
+                or os.path.getmtime(os.path.join(db_dir, name))
+                > os.path.getmtime(os.path.join(args.decrypted_dir, name))
+            )
+        ]
+        if stale:
+            print(f"[INFO] 源数据库有更新（{', '.join(stale)}），将重新解密...")
+            need_decrypt = True
+
+    if need_decrypt:
         if not db_dir:
-            print("[ERROR] 未找到解密数据库，请通过 --db-dir 指定企业微信 Data 目录，或先手动解密")
+            print("[ERROR] 未找到解密数据库，请通过 --db-dir 指定企业微信 Data 目录，"
+                  "或在 .env 中配置 WXWORK_DIR，或先手动解密")
             return
-        print("[INFO] 未找到解密数据库，尝试自动解密...")
-        reader = WeComReader(
-            db_dir=db_dir,
-            decrypted_dir=args.decrypted_dir,
-        )
-        result = reader.init(verbose=True)
-        if not result.get("success"):
-            print("[ERROR] 数据库解密失败")
+        print("[INFO] 开始解密...")
+        try:
+            reader = WeComReader(
+                db_dir=db_dir,
+                decrypted_dir=args.decrypted_dir,
+                wxwork_dir=wxwork_dir or None,
+            )
+            # 显式指定 --db-dir 时全量重新解密；仅因源库更新时增量解密
+            result = reader.init(verbose=True, force=bool(args.db_dir))
+        except RuntimeError as e:
+            print(f"[ERROR] 解密失败: {e}")
+            return
+        # 解密不完整（缺关键库）会表现为"匹配到 0 个会话"，这里直接报错提示
+        missing = [
+            name for name in ("session.db", "message.db", "user.db")
+            if not os.path.isfile(os.path.join(args.decrypted_dir, name))
+        ]
+        if missing or not result.get("success"):
+            print(f"[ERROR] 数据库解密不完整，缺少: {', '.join(missing) or '全部'}")
+            print("       请确认 WXWork 正在运行且脚本以管理员权限执行")
             return
         print(f"[INFO] 解密完成: {result}")
 
-    # ---- 5.3 读取群聊列表 ----
+    # ---- 5.3 读取会话列表 ----
     session_names = []
     list_path = args.conversation_list
     if not os.path.isfile(list_path):
-        print(f"[ERROR] 未找到群聊列表文件: {list_path}")
-        print("        请创建文件（每行一个群名），或通过 -c 参数指定路径")
+        print(f"[ERROR] 未找到会话列表文件: {list_path}")
+        print("        请创建文件（每行一个群名或人名），或通过 -c 参数指定路径")
         return
     with open(list_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:
                 session_names.append(line)
-    print(f"[INFO] 从 {list_path} 读取了 {len(session_names)} 个群聊名称")
+    print(f"[INFO] 从 {list_path} 读取了 {len(session_names)} 个会话名称")
     for s in session_names:
         print(f"       - {s}")
 
     # ---- 5.4 按名称搜索会话（从解密后的 session.db） ----
     sessions = []
     for name in session_names:
-        found = reader.list_sessions(limit=1, keyword=name)
-        sessions.extend(found)
+        # 1) 直接按名称/ID 匹配会话（群名、会话 ID 等）
+        found = reader.list_sessions(limit=10, keyword=name)
+        if found:
+            sessions.extend(found)
+
+        # 2) 按人名匹配单聊：S: 会话的 name 字段存的是最后一条消息预览而非
+        #    联系人名，所以先在 user.db 里按名字查对方 vid，再用 vid 匹配
+        #    会话 ID（S:<本人vid>_<对方vid> / M:<对方vid>）
+        person_hits = 0
+        for contact in reader.contacts(keyword=name):
+            hits = reader.list_sessions(limit=10, keyword=str(contact["id"]))
+            for hit in hits:
+                if hit["type"] not in ("single", "wechat_contact"):
+                    continue
+                # 会话自带 name 为消息预览时保留（更描述性），为空时用联系人名
+                if contact["name"] and not hit["name"]:
+                    hit = dict(hit)
+                    hit["name"] = contact["name"]
+                sessions.append(hit)
+                person_hits += 1
+
+        if not found and not person_hits:
+            print(f"[WARN] 名称未匹配到任何会话: {name}")
 
     # 去重（同一个会话可能被多个关键词匹配到）
     seen_ids = set()
@@ -610,9 +672,19 @@ def main():
             unique_sessions.append(s)
     sessions = unique_sessions
 
+    # 会话 name 为空时补名（否则输出文件名会冲突/为空）：
+    # 单聊优先解析对端联系人名，其余（含解析失败）用会话 ID 兜底
+    for s in sessions:
+        if s["name"]:
+            continue
+        if s["type"] in ("single", "wechat_contact"):
+            s["name"] = reader.single_chat_peer_name(s["id"]) or ""
+        if not s["name"]:
+            s["name"] = s["id"].replace(":", "_")
+
     print(f"[INFO] 匹配到 {len(sessions)} 个会话（已去重）")
     for s in sessions:
-        print(f"       - {s['name']} ({s['id']})")
+        print(f"       - {s['name']} ({s['id']}) [{s['type']}]")
 
     # ---- dry-run 模式：仅列出会话，不调用智能体 ----
     if args.dry_run:
@@ -755,8 +827,15 @@ def main():
             formatted_msgs = format_messages_for_prompt(day_msgs)
 
             # 构造完整 prompt = 聊天记录 + 提示词模板
+            # 会话类型不同文案不同：群聊/单聊/应用会话
+            session_label = {
+                "group": "群聊",
+                "single": "单聊",
+                "wechat_contact": "单聊",
+                "app": "应用会话",
+            }.get(session["type"], "会话")
             full_prompt = (
-                f"以下是 {session_name} 群聊在 {day_str} 的聊天记录：\n\n"
+                f"以下是 {session_name} 的{session_label}在 {day_str} 的聊天记录：\n\n"
                 f"{formatted_msgs}\n\n"
                 f"{prompt_template}"
             )
