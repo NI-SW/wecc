@@ -18,6 +18,7 @@ import base64
 import json
 import os
 import re
+import shutil
 import sys
 import time
 import urllib.request
@@ -27,6 +28,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from wecom_reader import WeComReader
+
+# 企业微信消息时间戳为 UTC epoch；按"北京自然日"切分与展示，避免 UTC 换日线
+# （北京时间 08:00）把早晨对话劈成两天。进度库的时间戳字符串仍按 UTC 存储/解析。
+CST = timezone(timedelta(hours=8))
+# 合并重算某一天时单次拉取的消息上限：远大于 --limit，避免忙天前半段被截断
+MERGE_FETCH_LIMIT = 10000
 
 
 # ============================================================
@@ -78,10 +85,13 @@ def call_agent(
     api_key: str,
     model: str = "hermes-agent",
     temperature: float = 0.1,
-    timeout: int = 300,
+    timeout: int = 600,
     retries: int = 3,
 ) -> Optional[str]:
     """调用 OpenAI 兼容的智能体 API，返回回复文本；失败自动重试。
+
+    timeout 默认 600 秒：多模态大请求（单日数百条消息+多张图片）的 agent
+    处理耗时较长，300 秒易触发 socket 读取超时。可通过 --agent-timeout 覆盖。
 
     返回 None 表示失败；服务端返回错误信息（如内部超时）时立即判定失败，
     不再做客户端重试（服务端通常已经重试过）。
@@ -425,7 +435,7 @@ def format_messages_for_prompt(msgs: list[dict]) -> str:
     for msg in msgs:
         ts = msg.get("send_time", 0)
         dt = (
-            datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            datetime.fromtimestamp(ts, tz=CST).strftime("%Y-%m-%d %H:%M:%S")
             if ts
             else "未知时间"
         )
@@ -455,11 +465,13 @@ def format_messages_for_prompt(msgs: list[dict]) -> str:
 # 4. 按天划分消息
 # ============================================================
 def group_messages_by_day(msgs: list[dict]) -> list[tuple[str, list[dict]]]:
-    """将消息列表按天分组，返回 [(日期字符串, 消息列表), ...]（按日期升序）"""
+    """将消息列表按天分组，返回 [(日期字符串, 消息列表), ...]（按日期升序）
+
+    日期按北京时间（UTC+8）划分，使"一天"与用户的自然日一致。"""
     days: dict[str, list[dict]] = {}
     for msg in msgs:
         ts = msg.get("send_time", 0)
-        day = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+        day = datetime.fromtimestamp(ts, tz=CST).strftime("%Y-%m-%d")
         days.setdefault(day, []).append(msg)
     # 按日期升序排列
     return sorted(days.items(), key=lambda x: x[0])
@@ -469,6 +481,110 @@ def msg_key(m: dict) -> str:
     """消息去重键（跨表查询时同一消息可能出现多次）"""
     mid = m.get("message_id")
     return f"id:{mid}" if mid is not None else f"seq:{m.get('sequence')}"
+
+
+# ============================================================
+# 4.5 跨天问题案例状态（cases 表）
+# ============================================================
+# status 是管线内部排程字段，不进 summary、不传 DataCop。
+# 仅用于决定次日 prompt 是否注入该问题，判据是本地启发式，不依赖 agent 标注。
+# 判"已解决"的启发式：solution 与 verification 均非空且非占位词才算 resolved。
+_PLACEHOLDER_SOLUTION = re.compile(
+    r"^\s*(待定|未知|暂无|无|none|n\/a|null|tbd|待确认|待排查|暂未|未定|-\s*)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _field_filled(value) -> bool:
+    """字段非空、非纯占位词视为有效。"""
+    if value is None:
+        return False
+    s = str(value).strip()
+    if not s:
+        return False
+    return not _PLACEHOLDER_SOLUTION.match(s)
+
+
+def case_status_from_summary(case: dict) -> str:
+    """根据 case 内容判断内部 status：solution+verification 双有效 → resolved，否则 open。
+
+    保守判：宁可多留一轮回注入，不可误判 resolved 后断链。
+    """
+    return "resolved" if (
+        _field_filled(case.get("solution"))
+        and _field_filled(case.get("verification"))
+    ) else "open"
+
+
+def fetch_open_cases(db: sq.Connection, session_id: str, today: str, limit: int = 30) -> list[dict]:
+    """取本会话截至 today 仍未解决（status='open'）的问题案例，按最近活跃降序。
+
+    返回原始 case dict 列表（含 name 与已有字段），供注入当日 prompt。
+    限制条数避免 prompt 膨胀。
+    """
+    rows = db.execute(
+        "SELECT summary_json FROM cases "
+        "WHERE session_id = ? AND status = 'open' AND last_seen_date < ? "
+        "ORDER BY updated_at DESC LIMIT ?",
+        (session_id, today, limit),
+    ).fetchall()
+    cases = []
+    for r in rows:
+        try:
+            cases.append(json.loads(r[0]))
+        except (json.JSONDecodeError, TypeError):
+            continue
+    return cases
+
+
+def build_open_cases_block(open_cases: list[dict]) -> str:
+    """把未解决案例拼成 prompt 文本块（精简版，不含 solution/verification，
+    避免引导 agent 照抄既有结论）。
+    """
+    if not open_cases:
+        return ""
+    lines = ["以下是此前尚未解决的问题，请结合今日聊天记录判断是否已有进展；",
+              "若与今日内容相关，请保持问题 name 不变并更新相关字段；",
+              "若今日未再提及，则无需重复输出该问题：\n"]
+    for i, c in enumerate(open_cases, 1):
+        parts = [f"{i}. [{c.get('name', '?')}]"]
+        for k in ("description", "symptoms", "cause"):
+            v = c.get(k)
+            if v:
+                parts.append(f"{k}: {v}")
+        lines.append("\n".join(parts))
+    return "\n".join(lines) + "\n"
+
+
+def upsert_cases(db: sq.Connection, session_id: str, session_name: str,
+                 day_str: str, summary_data) -> None:
+    """把当日 agent 输出的 case 按 name 写入 cases 表（upsert）。
+
+    已存在的同名问题：用最新内容覆盖，刷新 status / last_seen_date / updated_at。
+    新问题：插入。resolved 的不再注入后续 prompt，但仍保留记录用于上传与可追溯。
+    """
+    if not isinstance(summary_data, list):
+        return
+    # 与 sessions.last_msg_timestamp 一致，统一按 UTC 存储（见 AGENTS.md 约定）
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    for case in summary_data:
+        if not isinstance(case, dict):
+            continue
+        name = case.get("name")
+        if not name:
+            continue
+        status = case_status_from_summary(case)
+        db.execute(
+            "INSERT INTO cases (session_id, session_name, name, status, "
+            "last_seen_date, updated_at, summary_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(session_id, name) DO UPDATE SET "
+            "status=excluded.status, last_seen_date=excluded.last_seen_date, "
+            "updated_at=excluded.updated_at, summary_json=excluded.summary_json",
+            (session_id, session_name, name, status, day_str, now_str,
+             json.dumps(case, ensure_ascii=False)),
+        )
+    db.commit()
 
 
 # ============================================================
@@ -516,10 +632,10 @@ def parse_args():
                    help="企业微信 Profile 目录（用于本地图片缓存查找）")
     p.add_argument("-d", "--days",
                    type=int, default=7,
-                   help="拉取消息的时间窗口（天） (默认: 7)")
+                   help="首次处理时回溯的天数；增量处理时仅用作积压告警阈值，不影响实际拉取范围 (默认: 7)")
     p.add_argument("-l", "--limit",
                    type=int, default=300,
-                   help="每个会话最多拉取的消息条数 (默认: 300)")
+                   help="每轮单会话拉取的消息条数上限；超过则下次续取，不会丢消息 (默认: 300)")
     p.add_argument("--agent-url",
                    default=None,
                    help="智能体 API 地址（覆盖 .env 中的 AGENT_URL）")
@@ -532,6 +648,9 @@ def parse_args():
     p.add_argument("--temperature",
                    type=float, default=0.1,
                    help="模型温度，越低越确定性 (默认: 0.1)")
+    p.add_argument("--agent-timeout",
+                   type=int, default=600,
+                   help="单次 agent API 调用超时秒数；多模态大请求耗时较长 (默认: 600)")
     p.add_argument("--dry-run",
                    action="store_true",
                    help="仅列出匹配到的会话，不调用智能体（可用于验证配置）")
@@ -645,11 +764,13 @@ def main():
             sessions.extend(found)
 
         # 2) 按人名匹配单聊：S: 会话的 name 字段存的是最后一条消息预览而非
-        #    联系人名，所以先在 user.db 里按名字查对方 vid，再用 vid 匹配
-        #    会话 ID（S:<本人vid>_<对方vid> / M:<对方vid>）
+        #    联系人名，所以先在 user.db 里按名字查对方 vid，再用 vid 精确匹配
+        #    会话 ID（S:<本人vid>_<对方vid> / M:<对方vid>）。
+        #    注意不能把数字 vid 作为 keyword 走 name LIKE——会误命中群名/消息
+        #    预览里恰好含该数字的会话。
         person_hits = 0
         for contact in reader.contacts(keyword=name):
-            hits = reader.list_sessions(limit=10, keyword=str(contact["id"]))
+            hits = reader.list_sessions(limit=10, peer_id=str(contact["id"]))
             for hit in hits:
                 if hit["type"] not in ("single", "wechat_contact"):
                     continue
@@ -706,6 +827,20 @@ def main():
             last_msg_timestamp TEXT NOT NULL
         )
     """)
+    # 跨天问题案例状态：按 (session_id, name) 唯一，status 仅用于次日 prompt 注入
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS cases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            session_name TEXT NOT NULL,
+            name TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            last_seen_date TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            summary_json TEXT NOT NULL,
+            UNIQUE(session_id, name)
+        )
+    """)
     db.commit()
 
     # ---- 5.6 加载 prompt.md ----
@@ -743,7 +878,7 @@ def main():
             db.execute(
                 "INSERT INTO sessions (session_id, session_name, last_sequence, last_msg_timestamp) "
                 "VALUES (?, ?, ?, ?)",
-                (session_id, session_name, 0, "2000-01-01 00:00:00"),
+                (session_id, session_name, 0, "1970-01-01 00:00:00"),
             )
             db.commit()
             last_sequence = 0
@@ -751,7 +886,7 @@ def main():
             print("[INFO] 新会话，将从最早未处理的消息开始")
         else:
             last_sequence = row[3] if row[3] is not None else 0
-            last_ts_str = row[4] if row[4] is not None else "2000-01-01 00:00:00"
+            last_ts_str = row[4] if row[4] is not None else "1970-01-01 00:00:00"
             try:
                 last_dt = datetime.strptime(last_ts_str, "%Y-%m-%d %H:%M:%S")
                 last_timestamp = int(last_dt.replace(tzinfo=timezone.utc).timestamp())
@@ -762,20 +897,30 @@ def main():
                 f"timestamp={last_ts_str}"
             )
 
-        # 计算时间范围：从上次处理时间或 7 天前，到当前时间
-        since_time = max(last_timestamp, now_ts - from_time_seconds)
+        # 计算增量取数范围：
+        # - 增量按 sequence 过滤（after_sequence），彻底规避 send_time 与 sequence
+        #   偶尔倒挂导致的漏消息（延迟入库的消息 sequence 更大但 send_time 更早）。
+        # - 首次处理（last_sequence=0）额外用 --days 限定回溯窗口，避免一次拉全部历史。
+        if last_sequence > 0:
+            fetch_since = None  # 增量不按时间过滤，纯按 sequence 追平积压
+            if last_timestamp > 0 and now_ts - last_timestamp > from_time_seconds:
+                print(
+                    f"[WARN] 进度落后超过 {args.days} 天，将追平全部积压消息；"
+                    f"单次最多处理 {message_limit} 条，剩余下次继续"
+                )
+        else:
+            fetch_since = max(0, now_ts - from_time_seconds)
 
-        # 获取消息（按时间范围）
+        # 升序取最旧的一批（sequence 升序），超过 limit 时下次续取，绝不丢消息
         msgs = reader.get_messages(
             session_id,
             limit=message_limit,
-            since=since_time,
+            since=fetch_since,
+            after_sequence=last_sequence,
+            ascending=True,
         )
         # 从旧到新排序，便于按天分组
         msgs.sort(key=lambda m: m.get("sequence", 0))
-        # since 边界是包含的，最后一条已处理消息会被重复拉取，这里过滤掉，
-        # 保证没有新消息时不重复调用智能体
-        msgs = [m for m in msgs if m.get("sequence", 0) > last_sequence]
 
         if not msgs:
             print("[INFO] 没有新消息")
@@ -783,7 +928,10 @@ def main():
 
         print(
             f"[INFO] 获取到 {len(msgs)} 条消息 "
-            f"(自 {datetime.fromtimestamp(since_time, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S')})"
+            f"(自 sequence>{last_sequence}"
+            + (f", 时间>={datetime.fromtimestamp(fetch_since, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}"
+               if fetch_since is not None else "")
+            + ")"
         )
 
         # 按天分组
@@ -800,18 +948,19 @@ def main():
             # 补拉当天完整消息重新总结，避免当天文件只覆盖新增消息而丢失已有总结
             if idx == 0 and last_sequence > 0:
                 last_day_str = datetime.fromtimestamp(
-                    last_timestamp, tz=timezone.utc
+                    last_timestamp, tz=CST
                 ).strftime("%Y-%m-%d")
                 if day_str == last_day_str:
                     day_start = datetime.fromtimestamp(
-                        last_timestamp, tz=timezone.utc
+                        last_timestamp, tz=CST
                     ).replace(hour=0, minute=0, second=0, microsecond=0)
                     day_end = day_start + timedelta(days=1)
                     full_day = reader.get_messages(
                         session_id,
-                        limit=message_limit,
+                        limit=MERGE_FETCH_LIMIT,
                         since=int(day_start.timestamp()),
                         until=int(day_end.timestamp()),
+                        ascending=True,
                     )
                     merged = {msg_key(m): m for m in full_day}
                     for m in day_msgs:
@@ -826,7 +975,7 @@ def main():
             # 格式化消息文本
             formatted_msgs = format_messages_for_prompt(day_msgs)
 
-            # 构造完整 prompt = 聊天记录 + 提示词模板
+            # 构造完整 prompt = 聊天记录 + 未解决问题上下文 + 提示词模板
             # 会话类型不同文案不同：群聊/单聊/应用会话
             session_label = {
                 "group": "群聊",
@@ -834,9 +983,15 @@ def main():
                 "wechat_contact": "单聊",
                 "app": "应用会话",
             }.get(session["type"], "会话")
+            # 注入此前仍未解决的问题（跨天承接）：保持 name 不变以便聚合去重
+            open_cases = fetch_open_cases(db, session_id, day_str)
+            open_cases_block = build_open_cases_block(open_cases)
+            if open_cases_block:
+                print(f"  [BACKLOG] 注入 {len(open_cases)} 条未解决问题作为上下文")
             full_prompt = (
                 f"以下是 {session_name} 的{session_label}在 {day_str} 的聊天记录：\n\n"
                 f"{formatted_msgs}\n\n"
+                f"{open_cases_block}"
                 f"{prompt_template}"
             )
 
@@ -883,6 +1038,7 @@ def main():
                 api_key=agent_api_key,
                 model=args.model,
                 temperature=args.temperature,
+                timeout=args.agent_timeout,
             )
 
             if response is None:
@@ -929,6 +1085,7 @@ def main():
                     api_key=agent_api_key,
                     model=args.model,
                     temperature=args.temperature,
+                    timeout=args.agent_timeout,
                 )
                 if next_response is None:
                     break
@@ -966,6 +1123,11 @@ def main():
             os.makedirs(day_output_dir, exist_ok=True)
             out_file = os.path.join(day_output_dir, f"summary_{safe_name}.json")
 
+            # 合并重算当天会覆盖已有文件，先备份一份 .bak，避免重算失败时丢失原总结
+            if os.path.isfile(out_file):
+                bak_file = out_file + ".bak"
+                shutil.copy2(out_file, bak_file)
+
             output = {
                 "session_id": session_id,
                 "session_name": session_name,
@@ -977,6 +1139,10 @@ def main():
             with open(out_file, "w", encoding="utf-8") as f:
                 json.dump(output, f, ensure_ascii=False, indent=2)
             print(f"  [SAVE] 总结已保存到 {out_file}")
+
+            # 按 name 写入 cases 表（upsert）：跨天承接的依据，resolved 的不再注入后续
+            if parsed_ok:
+                upsert_cases(db, session_id, session_name, day_str, summary_data)
 
             # 当天处理成功，推进进度到该天最后一条消息
             day_max_seq = max(m.get("sequence", 0) for m in day_msgs)

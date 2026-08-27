@@ -34,17 +34,29 @@ There is no lint/typecheck/test setup, no `requirements.txt` (deps live in `weco
 
 ## Data flow & boundaries
 
-`WeComReader` (in `wecom-reader/`) owns **all** WeCom DB access and decryption. `main.py` never opens WeCom SQLite directly — it calls `reader.list_sessions / get_messages / get_image_path / download_image`. The only DB `main.py` writes itself is the small progress DB at `data/wecom.db`.
+`WeComReader` (in `wecom-reader/`) owns **all** WeCom DB access and decryption. `main.py` never opens WeCom SQLite directly — it calls `reader.list_sessions / get_messages / get_image_path / download_image`. The only DB `main.py` writes itself is the small progress DB at `data/wecom.db`, which holds two tables: `sessions` (per-session fetch progress) and `cases` (cross-day problem-case state).
 
-Per-session loop: fetch new messages since last progress → filter to `sequence > last_sequence` → group by UTC day → for each day, merge if it overlaps the prior progress day → build prompt (chat text + `prompt.md`) → call agent → parse → save to `summary/<YYMMDD>/summary_<safe_name>.json` → advance progress **only on success** (failures resume next run).
+Per-session loop: fetch new messages since last progress → filter to `sequence > last_sequence` → group by **Beijing** day → for each day, merge if it overlaps the prior progress day → build prompt (chat text + **injected open backlog** + `prompt.md`) → call agent → parse → save to `summary/<YYMMDD>/summary_<safe_name>.json` → **upsert cases table** → advance progress **only on success** (failures resume next run).
+
+### Cross-day problem continuity (`cases` table)
+
+A problem may span multiple days (reported Mon, diagnosed Tue, solved Wed). To let each day's summary see prior context, `main.py` maintains a `cases` table keyed by `(session_id, name)`:
+
+- **Before** calling the agent for a day, `fetch_open_cases` reads `status='open'` cases for that session (excluding today) and `build_open_cases_block` injects a *trimmed* view (name + description + symptoms + cause, **not** solution/verification) into the prompt. The prompt instructs the agent to keep `name` stable for ongoing problems and update fields; only brand-new problems get a fresh name. Name stability is what makes the eventual aggregation key work.
+- **After** a successful parse, `upsert_cases` writes each output case by `(session_id, name)`: new rows inserted, existing rows overwritten with the latest content.
+- `status` is an **internal pipeline field** (`open`/`resolved`), decided by `case_status_from_summary` — a **heuristic**, not agent output: `solution` **and** `verification` both non-empty and non-placeholder ⇒ `resolved`, else `open`. It is deliberately conservative (prefer re-injecting an extra round over breaking a chain). `status` never appears in the summary JSON and is never uploaded to DataCop (DataCop has its own `pending`/`valid` review status). The 9 summary fields are exactly what `prompt.md` defines; `upload.py` only forwards those 9.
+- `resolved` cases stop being injected but stay in the table for upload/traceability. The table's final per-`name` row is the authoritative "one case" for that problem.
 
 ## Conventions
 
 - Docstrings/comments and many data values are **Chinese**; identifiers are English. Preserve this when editing.
 - `main.py` networking uses `urllib` (stdlib), not `requests` — keep it dependency-free.
 - Type hints use Python 3.10+ syntax (`list[dict]`, `X | None`).
-- Timestamps are consistently **UTC** (`datetime.fromtimestamp(..., tz=timezone.utc)`). The progress DB stores them as `"%Y-%m-%d %H:%M:%S"` strings interpreted as UTC. Don't mix in local time.
-- Output filenames: session name is sanitized (special chars → `_`, truncated to 80 chars); date dir is `YYMMDD` (`2026-08-14` → `260809`).
+- Message `send_time` is a **UTC epoch** (seconds). `wecom-reader` stores/returns it raw, no timezone conversion.
+- **Day slicing uses Beijing time (UTC+8)** so a "day" matches the users' natural day, not the UTC day whose cutoff falls at 08:00 Beijing. `main.py` defines `CST = timezone(timedelta(hours=8))` and uses it for `group_messages_by_day`, `format_messages_for_prompt`, and the merge-recompute day boundaries. The progress DB still stores timestamps as `"%Y-%m-%d %H:%M:%S"` strings interpreted as **UTC** (progress points are instants, not day labels) — keep that split: progress = UTC instant, day labels = Beijing.
+- **Incremental fetch is ascending.** `main.py` calls `reader.get_messages(..., ascending=True)` so the oldest unprocessed batch comes back first; progress advances to the max processed sequence and the rest is picked up next run. Never switch the main fetch back to `ascending=False` (newest-first) — that silently drops the oldest messages when a day exceeds `--limit` and advances progress past them. The merge-recompute fetch also uses `ascending=True` with a large `MERGE_FETCH_LIMIT` for the same reason.
+- **`sequence` and `send_time` can be out of order.** WeCom's `sequence` is the insert order; `send_time` is the send instant. A message delayed at ingest has a larger `sequence` but an *earlier* `send_time` than an already-processed one. Incremental fetch therefore filters by **`after_sequence` (sequence > last_sequence)**, NOT `since` (send_time >= last_ts) — `since` would skip those reordered messages and, since progress then advances past them, lose them permanently. `since`/`until` are only used for the **first-run lookback window** and the **merge-recompute full-day range** (where a time range is semantically correct). Don't "simplify" the incremental fetch back to a single `since` filter.
+- Output filenames: session name is sanitized (special chars → `_`, truncated to 80 chars); date dir is `YYMMDD` derived from the **Beijing** date (`2026-08-14` → `260814`).
 
 ## Gotchas
 
