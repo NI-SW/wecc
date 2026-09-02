@@ -20,6 +20,12 @@ import requests
 # ── 加载 upload.env ──────────────────────────────────────────────
 ENV_FILE = Path(__file__).parent / "upload.env"
 
+# 上传到 DataCop 的 9 个字段（与 prompt.md 定义的 summary 结构一致）
+FIELDS = [
+    "name", "description", "scenario", "trigger_method",
+    "symptoms", "cause", "solution", "verification", "notes",
+]
+
 
 def load_env(path: Path) -> dict:
     """解析 KEY=VALUE 格式的 .env 文件，忽略注释和空行。"""
@@ -59,11 +65,7 @@ class DataCopClient:
 
     def create_problem(self, project_id: int, problem: dict) -> dict:
         """向指定项目上传单条问题。"""
-        fields = [
-            "name", "description", "scenario", "trigger_method",
-            "symptoms", "cause", "solution", "verification", "notes",
-        ]
-        payload = {k: problem.get(k, "") for k in fields}
+        payload = {k: problem.get(k, "") for k in FIELDS}
         if not payload.get("name"):
             raise ValueError("问题 name 不能为空")
         resp = self.session.post(
@@ -112,6 +114,22 @@ def _display_path(filepath: Path, summary_dir: Path) -> str:
         return filepath.name
 
 
+def _field_to_text(value) -> str:
+    """把 agent 可能输出的数组/数字等非字符串字段规范为字符串，列表按行拼接。"""
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return "\n".join(str(item) for item in value)
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def normalize_problem(problem: dict) -> dict:
+    """规范化单条问题：仅保留 9 个上传字段，非字符串一律转为字符串。"""
+    return {k: _field_to_text(problem.get(k, "")) for k in FIELDS}
+
+
 def extract_problems(filepath: Path) -> list[dict]:
     """从 summary JSON 文件中提取问题列表。"""
     with open(filepath, "r", encoding="utf-8") as f:
@@ -120,7 +138,7 @@ def extract_problems(filepath: Path) -> list[dict]:
     problems = data.get("summary", [])
     if not problems:
         print(f"  [SKIP] {filepath.name}: 无 summary 数据")
-    return problems
+    return [normalize_problem(p) for p in problems]
 
 
 def main():
