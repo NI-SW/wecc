@@ -12,7 +12,7 @@ A pipeline that turns **企业微信 (WeCom) group-chat history** into structure
 |------|------|
 | `main.py` | Orchestrator: read WeCom DBs → group by day → call agent API → parse JSON → save summary → track progress. Uses **stdlib only** (urllib, sqlite3) + `wecom_reader`. |
 | `wecom-reader/` | Nested library providing `WeComReader` (decrypts & reads WeCom local SQLite). **Its own git repo**, tracked as a gitlink — see gotcha below. |
-| `summary/upload.py` | Uploads summary JSONs to the DataCop platform (uses `requests`). Reads `summary/upload.env`. |
+| `summary/upload.py` | Uploads summary JSONs to the DataCop platform (uses `requests`). Reads `summary/upload.env`. Skips problems whose `solution` is empty (same placeholder rule as `main.py`'s `_field_filled`); `--cleanup` deletes DataCop's pending (`待定`) problems with empty `solution`. |
 | `prompt.md` | LLM prompt template — defines the exact JSON problem-summary schema (`name`, `description`, `scenario`, `trigger_method`, `symptoms`, `cause`, `solution`, `verification`, `notes`, `status`). Changing this changes output structure. |
 | `conversation.list` | Group-chat names to process, one per line. Edit to select which groups are summarized. |
 | `initdb.sql` | Schema for the progress DB (`sessions` table). Applied lazily by `main.py`. |
@@ -27,7 +27,7 @@ A pipeline that turns **企业微信 (WeCom) group-chat history** into structure
 - **Interpreter:** the project venv is `.venv` (Python 3.11). Use `.venv/Scripts/python.exe`; the bare `python`/`python3` on PATH hits the Windows Store stub and fails. The `py` launcher works (`py --version`).
 - `wecom-reader` is installed **editable** in the venv (egg-info → local `wecom-reader/` dir), so edits to the nested package take effect without reinstall.
 - **Main run:** `python main.py` — see `python main.py -h` for flags (`-d/--days`, `-l/--limit`, `-o/--output-dir`, `--dry-run`, `--temperature`, `--agent-url`, `--decrypted-dir`, `--db-dir`, `--wxwork-dir`). Config priority: CLI args > `.env` > defaults.
-- **Upload:** `cd summary && python upload.py [--dry-run] [files...]`
+- **Upload:** `cd summary && python upload.py [--dry-run] [files...]`. Problems with an empty `solution` (empty or placeholder-only, e.g. 无/暂无/待定) are never uploaded. Data cleanup: `python upload.py --cleanup [--dry-run]` sweeps every visible project and deletes pending problems with empty `solution`.
 - **Scratch decrypt test:** `parsedb.py` (throwaway script, not part of the pipeline).
 
 There is no lint/typecheck/test setup, no `requirements.txt` (deps live in `wecom-reader/pyproject.toml` + editable install), and no CI. The venv already has `pycryptodomex`, `click`, `Flask`, `requests`, `wecom-reader`.

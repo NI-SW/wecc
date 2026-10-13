@@ -60,7 +60,13 @@ def load_env(path: str = ".env") -> dict:
 # ============================================================
 # 2. 调用智能体 API（OpenAI 兼容格式）
 # ============================================================
-# 智能体服务端超时/故障时，会把错误信息作为 content 返回，需识别并当作失败处理
+# 期望的问题总结结构中应出现的字段（用于校验候选是否为有效总结而非中间噪声）
+_EXPECTED_KEYS = ("name", "description", "scenario", "trigger_method",
+                  "symptoms", "cause", "solution", "verification", "notes", "status")
+
+# 智能体服务端超时/故障时，会把错误信息作为 content 返回，需识别并当作失败处理。
+# 这些短语同样会出现在正常总结里（技术群讨论 "internal server error" 很常见），
+# 所以只能在响应"看起来确实是错误页"时才匹配，见 _is_error_content。
 _ERROR_CONTENT_PATTERNS = (
     "api call failed",
     "request timed out",
@@ -72,11 +78,28 @@ _ERROR_CONTENT_PATTERNS = (
 
 
 def _is_error_content(text: str) -> bool:
-    """判断响应内容是否是服务端返回的错误信息（而非正常模型输出）"""
-    t = text.strip().lower()
+    """判断响应内容是否是服务端返回的错误信息（而非正常模型输出）。
+
+    不能只做子串匹配：总结的 description/symptoms 完全可能含 "internal
+    server error" 这类短语。一旦误判，当天会被当作调用失败且进度不推进，
+    该会话从此永久卡在这一天。因此先排除"是正常输出"的情况——含预期总结
+    字段、或本身就是可解析 JSON 的，一律按正常输出处理；剩下的短错误文本
+    才去匹配错误短语。
+    """
+    t = text.strip()
     if not t:
         return True
-    return any(p in t for p in _ERROR_CONTENT_PATTERNS)
+    low = t.lower()
+    # 含问题总结的预期字段 → 正常输出
+    if any(k in low for k in _EXPECTED_KEYS):
+        return False
+    # 可解析为 JSON（如 [{"name":...}] 或 {"error":...}）→ 交给解析流程判断
+    try:
+        json.loads(t)
+        return False
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return any(p in low for p in _ERROR_CONTENT_PATTERNS)
 
 
 def call_agent(
@@ -202,11 +225,6 @@ def _extract_json_candidates(response: str) -> list[str]:
     return unique
 
 
-# 期望的问题总结结构中应出现的字段（用于校验候选是否为有效总结而非中间噪声）
-_EXPECTED_KEYS = ("name", "description", "scenario", "trigger_method",
-                  "symptoms", "cause", "solution", "verification", "notes", "status")
-
-
 def _looks_like_summary(data) -> bool:
     """校验解析结果是否符合 prompt.md 要求的问题总结结构"""
     if isinstance(data, list):
@@ -303,8 +321,9 @@ def parse_agent_response(response: str):
             continue
         for o in objs:
             if isinstance(o, dict) and any(k in o for k in _EXPECTED_KEYS):
-                # 用 name 字段去重（不同候选可能解析出同一对象）
-                key = o.get("name", id(o))
+                # 用 name 去重（不同候选常解析出同一对象）；name 缺失时退回按内容
+                # 去重——用 id(o) 等于每个对象都唯一，去重形同虚设
+                key = o.get("name") or json.dumps(o, ensure_ascii=False, sort_keys=True)
                 if key not in seen_names:
                     seen_names.add(key)
                     all_objects.append(o)
@@ -433,7 +452,7 @@ def format_messages_for_prompt(msgs: list[dict]) -> str:
     """将消息列表格式化为适合 LLM 阅读的文本格式"""
     lines = []
     for msg in msgs:
-        ts = msg.get("send_time", 0)
+        ts = msg.get("send_time") or 0
         dt = (
             datetime.fromtimestamp(ts, tz=CST).strftime("%Y-%m-%d %H:%M:%S")
             if ts
@@ -470,7 +489,7 @@ def group_messages_by_day(msgs: list[dict]) -> list[tuple[str, list[dict]]]:
     日期按北京时间（UTC+8）划分，使"一天"与用户的自然日一致。"""
     days: dict[str, list[dict]] = {}
     for msg in msgs:
-        ts = msg.get("send_time", 0)
+        ts = msg.get("send_time") or 0
         day = datetime.fromtimestamp(ts, tz=CST).strftime("%Y-%m-%d")
         days.setdefault(day, []).append(msg)
     # 按日期升序排列
@@ -739,6 +758,15 @@ def main():
             return
         print(f"[INFO] 解密完成: {result}")
 
+        # 未 checkpoint 的 WAL 里存着最新消息，只解密 .db 会静默漏掉它们
+        wal_pending = result.get("wal_pending") or []
+        if wal_pending:
+            print(
+                f"[WARN] 检测到未 checkpoint 的 WAL 文件: {', '.join(wal_pending)}\n"
+                f"       其中的最新消息不会被解密，可能漏消息。\n"
+                f"       请先正常退出企业微信（由它自行 checkpoint）后重新运行本脚本"
+            )
+
     # ---- 5.3 读取会话列表 ----
     session_names = []
     list_path = args.conversation_list
@@ -919,8 +947,8 @@ def main():
             after_sequence=last_sequence,
             ascending=True,
         )
-        # 从旧到新排序，便于按天分组
-        msgs.sort(key=lambda m: m.get("sequence", 0))
+        # 从旧到新排序，便于按天分组（sequence 为 NULL 时按 0 处理，避免排序比较报错）
+        msgs.sort(key=lambda m: m.get("sequence") or 0)
 
         if not msgs:
             print("[INFO] 没有新消息")
@@ -966,7 +994,7 @@ def main():
                     for m in day_msgs:
                         merged.setdefault(msg_key(m), m)
                     day_msgs = sorted(
-                        merged.values(), key=lambda m: m.get("sequence", 0)
+                        merged.values(), key=lambda m: m.get("sequence") or 0
                     )
                     print(f"  [MERGE] 当天与上次进度重叠，补拉完整一天: {len(day_msgs)} 条消息")
 
@@ -1140,13 +1168,23 @@ def main():
                 json.dump(output, f, ensure_ascii=False, indent=2)
             print(f"  [SAVE] 总结已保存到 {out_file}")
 
+            # 解析失败：原始响应已另存供人工处理，但绝不能推进进度——
+            # 否则这一天被永久标记为已处理，cases 表也无记录，跨天承接链断掉，
+            # 且永远不会重算。与 API 调用失败同样处理：停在这里，下次重试。
+            if not parsed_ok:
+                print(
+                    f"  [ERROR] {day_str} 的响应无法解析为问题总结，"
+                    f"原始文本已保存到 {out_file}；进度不推进，"
+                    f"下次运行将重新处理这一天"
+                )
+                break
+
             # 按 name 写入 cases 表（upsert）：跨天承接的依据，resolved 的不再注入后续
-            if parsed_ok:
-                upsert_cases(db, session_id, session_name, day_str, summary_data)
+            upsert_cases(db, session_id, session_name, day_str, summary_data)
 
             # 当天处理成功，推进进度到该天最后一条消息
-            day_max_seq = max(m.get("sequence", 0) for m in day_msgs)
-            day_max_ts = max(m.get("send_time", 0) for m in day_msgs)
+            day_max_seq = max((m.get("sequence") or 0) for m in day_msgs)
+            day_max_ts = max((m.get("send_time") or 0) for m in day_msgs)
             success_sequence = max(success_sequence, day_max_seq)
             success_timestamp = max(success_timestamp, day_max_ts)
 
